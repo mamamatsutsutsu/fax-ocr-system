@@ -1,7 +1,4 @@
 streamlit
-google-generative-ai
-pandas
+google-generativeai
 Pillow
-gspread
-oauth2client
-reportlab
+pandas
