@@ -7,6 +7,7 @@ import re
 import time
 import io
 from datetime import datetime
+
 import fitz  # PyMuPDF
 
 from reportlab.pdfgen import canvas
@@ -14,54 +15,25 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 
 
-# -----------------------------
-# Helpers: Image preprocessing
-# -----------------------------
-def preprocess_image(img: Image.Image, contrast: float, sharpen: bool, binarize: bool) -> Image.Image:
-    # Grayscale
-    x = img.convert("L")
-    # Contrast
-    x = ImageEnhance.Contrast(x).enhance(contrast)
-    # Sharpen
-    if sharpen:
-        x = x.filter(ImageFilter.SHARPEN)
-    # Binarize (simple threshold)
-    if binarize:
-        x = x.point(lambda p: 255 if p > 160 else 0)
-    return x
+# =========================
+# Defaults (safe & practical)
+# =========================
+DEFAULT_MAX_PDF_PAGES = 5
+DEFAULT_DPI = 220
+DEFAULT_TEMPERATURE = 0.1
+DEFAULT_MAX_OUTPUT_TOKENS = 900
 
 
-# -----------------------------
-# Helpers: PDF -> images
-# -----------------------------
-def pdf_to_images(file_bytes: bytes, max_pages: int, dpi: int) -> tuple[list[Image.Image], int, int]:
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    total_pages = len(doc)
-    use_pages = min(total_pages, max_pages)
-
-    images: list[Image.Image] = []
-    for i in range(use_pages):
-        page = doc.load_page(i)
-        pix = page.get_pixmap(dpi=dpi)
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        images.append(img)
-
-    return images, total_pages, use_pages
-
-
-# -----------------------------
-# Helpers: robust JSON extract
-# -----------------------------
+# =========================
+# Robust JSON extraction
+# =========================
 _JSON_ARRAY_RE = re.compile(r"\[[\s\S]*\]")
 
 def safe_json_extract(text: str):
-    """
-    Returns list[dict] or None
-    """
     if not text:
         return None
 
-    # 1) try direct bracket slice (fast)
+    # 1) bracket slice
     try:
         s = text.find("[")
         e = text.rfind("]") + 1
@@ -70,7 +42,7 @@ def safe_json_extract(text: str):
     except Exception:
         pass
 
-    # 2) remove code fences and retry
+    # 2) strip code fences
     try:
         cleaned = text.replace("```json", "").replace("```", "").strip()
         s = cleaned.find("[")
@@ -80,7 +52,7 @@ def safe_json_extract(text: str):
     except Exception:
         pass
 
-    # 3) regex capture largest array
+    # 3) regex largest array
     try:
         m = _JSON_ARRAY_RE.search(text)
         if m:
@@ -91,9 +63,6 @@ def safe_json_extract(text: str):
     return None
 
 
-# -----------------------------
-# Helpers: normalize rows
-# -----------------------------
 REQUIRED_KEYS = ["注文日", "顧客名", "品名", "規格・サイズ", "数量", "単位", "備考"]
 
 def normalize_rows(rows, meta: dict):
@@ -104,15 +73,45 @@ def normalize_rows(rows, meta: dict):
         if not isinstance(r, dict):
             continue
         item = {k: str(r.get(k, "") if r.get(k, "") is not None else "") for k in REQUIRED_KEYS}
-        # meta
         item.update(meta)
         out.append(item)
     return out
 
 
-# -----------------------------
-# PDF output
-# -----------------------------
+# =========================
+# Preprocess (OCR-like)
+# =========================
+def preprocess_image(img: Image.Image, contrast: float, sharpen: bool, binarize: bool) -> Image.Image:
+    x = img.convert("L")
+    x = ImageEnhance.Contrast(x).enhance(contrast)
+    if sharpen:
+        x = x.filter(ImageFilter.SHARPEN)
+    if binarize:
+        x = x.point(lambda p: 255 if p > 160 else 0)
+    return x
+
+
+# =========================
+# PDF -> images
+# =========================
+def pdf_to_images(pdf_bytes: bytes, max_pages: int, dpi: int) -> tuple[list[Image.Image], int, int]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total_pages = len(doc)
+    use_pages = min(total_pages, max_pages)
+
+    images = []
+    for i in range(use_pages):
+        page = doc.load_page(i)
+        pix = page.get_pixmap(dpi=dpi)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        images.append(img)
+
+    return images, total_pages, use_pages
+
+
+# =========================
+# PDF output (simple)
+# =========================
 def create_simple_pdf(df: pd.DataFrame) -> io.BytesIO:
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
@@ -126,43 +125,50 @@ def create_simple_pdf(df: pd.DataFrame) -> io.BytesIO:
     c.drawString(20 * mm, y, f"Issued: {datetime.now().strftime('%Y-%m-%d')}")
     y -= 10 * mm
 
-    c.setFont("Helvetica", 9)
-    headers = ["注文日", "顧客名", "品名", "規格・サイズ", "数量", "単位", "備考"]
-    colx = [20, 45, 85, 125, 155, 168, 180]
+    headers = ["注文日", "顧客名", "品名", "規格・サイズ", "数量", "単位", "備考", "元ファイル", "ページ"]
+    colx = [15, 38, 70, 110, 140, 152, 165, 178, 192]
+
+    c.setFont("Helvetica", 8)
     for i, h in enumerate(headers):
         c.drawString(colx[i] * mm, y, h)
+    y -= 4 * mm
+    c.line(12 * mm, y, 198 * mm, y)
     y -= 6 * mm
-    c.line(15 * mm, y, 195 * mm, y)
-    y -= 8 * mm
 
     for _, row in df.iterrows():
-        if y < 20 * mm:
+        if y < 15 * mm:
             c.showPage()
             y = 285 * mm
-            c.setFont("Helvetica", 9)
+            c.setFont("Helvetica", 8)
 
-        c.drawString(20 * mm, y, str(row.get("注文日", ""))[:10])
-        c.drawString(45 * mm, y, str(row.get("顧客名", ""))[:10])
-        c.drawString(85 * mm, y, str(row.get("品名", ""))[:14])
-        c.drawString(125 * mm, y, str(row.get("規格・サイズ", ""))[:12])
-        c.drawString(155 * mm, y, str(row.get("数量", ""))[:6])
-        c.drawString(168 * mm, y, str(row.get("単位", ""))[:6])
-        c.drawString(180 * mm, y, str(row.get("備考", ""))[:10])
-        y -= 8 * mm
+        vals = [
+            str(row.get("注文日", ""))[:10],
+            str(row.get("顧客名", ""))[:10],
+            str(row.get("品名", ""))[:14],
+            str(row.get("規格・サイズ", ""))[:12],
+            str(row.get("数量", ""))[:6],
+            str(row.get("単位", ""))[:6],
+            str(row.get("備考", ""))[:10],
+            str(row.get("元ファイル", ""))[:12],
+            str(row.get("ページ", ""))[:2],
+        ]
+        for i, v in enumerate(vals):
+            c.drawString(colx[i] * mm, y, v)
+        y -= 7 * mm
 
     c.save()
     buf.seek(0)
     return buf
 
 
-# -----------------------------
-# Gemini model (cached)
-# -----------------------------
+# =========================
+# Model (cached)
+# =========================
 @st.cache_resource
-def get_model(api_key: str, temperature: float, max_output_tokens: int):
+def get_model(api_key: str, model_name: str, temperature: float, max_output_tokens: int):
     genai.configure(api_key=api_key)
     return genai.GenerativeModel(
-        "gemini-1.5-flash",
+        model_name,
         generation_config={
             "temperature": temperature,
             "max_output_tokens": max_output_tokens,
@@ -170,11 +176,10 @@ def get_model(api_key: str, temperature: float, max_output_tokens: int):
     )
 
 
-# -----------------------------
+# =========================
 # Prompt (accuracy boosted)
-# -----------------------------
+# =========================
 def build_prompt() -> str:
-    # 重要：説明文やコードブロックを禁止し、「JSON配列のみ」を強制
     return """
 あなたは「FAX受注書」から受注データだけを抽出する専用システムです。
 必ず【JSON配列】だけを出力してください。前置き/説明/コメント/コードブロックは禁止です。
@@ -187,7 +192,7 @@ def build_prompt() -> str:
 - 不明な項目は空文字 "" とする
 - 1枚に複数行の注文があれば複数要素で返す
 
-【JSONキー（固定・順序は問わない）】
+【JSONキー（固定）】
 [
   {
     "注文日":"YYYY/MM/DD",
@@ -199,12 +204,12 @@ def build_prompt() -> str:
     "備考":""
   }
 ]
-"""
+""".strip()
 
 
-# -----------------------------
+# =========================
 # Main
-# -----------------------------
+# =========================
 def run():
     api_key = st.secrets.get("GOOGLE_API_KEY")
     if not api_key:
@@ -212,38 +217,48 @@ def run():
         st.info('Streamlit Cloud → Manage app → Settings → Secrets に `GOOGLE_API_KEY="..."` を設定してください。')
         st.stop()
 
-    # Session state init
     if "orders" not in st.session_state:
         st.session_state.orders = pd.DataFrame()
     if "logs" not in st.session_state:
         st.session_state.logs = []
 
-    # ---------------- UI header ----------------
     st.title("🌲 FAX Order Intelligence")
     st.caption("PDF/Images → Preprocess → Gemini Extraction → Editable Orders → Export")
 
+    # ---- Settings panel ----
     with st.expander("⚙️ Processing Settings", expanded=True):
-        colA, colB, colC = st.columns(3)
+        col1, col2, col3 = st.columns(3)
 
-        with colA:
-            max_pages = st.slider("PDF page limit", min_value=1, max_value=20, value=5, step=1)
-            dpi = st.slider("PDF render DPI", min_value=120, max_value=300, value=220, step=10)
-        with colB:
-            # コスト制御：低温度 + 出力トークン上限
-            temperature = st.slider("Temperature (stability)", min_value=0.0, max_value=1.0, value=0.1, step=0.05)
-            max_output_tokens = st.slider("Max output tokens (cost control)", min_value=200, max_value=2500, value=900, step=100)
-        with colC:
-            contrast = st.slider("Preprocess contrast", min_value=1.0, max_value=3.0, value=2.2, step=0.1)
-            sharpen = st.checkbox("Sharpen", value=True)
-            binarize = st.checkbox("Binarize", value=False)
+        with col1:
+            max_pages = st.slider("PDF page limit", 1, 30, DEFAULT_MAX_PDF_PAGES, 1)
+            dpi = st.slider("PDF render DPI", 120, 320, DEFAULT_DPI, 10)
 
-        retry_json = st.checkbox("Auto-retry if JSON parse fails (1 retry)", value=True)
-        show_raw = st.checkbox("Debug: show raw model response", value=False)
+        with col2:
+            # cost control
+            temperature = st.slider("Temperature (stability)", 0.0, 1.0, DEFAULT_TEMPERATURE, 0.05)
+            max_output_tokens = st.slider("Max output tokens (cost control)", 200, 2500, DEFAULT_MAX_OUTPUT_TOKENS, 100)
 
-    model = get_model(api_key, temperature, max_output_tokens)
+        with col3:
+            contrast = st.slider("Preprocess contrast", 1.0, 3.0, 2.2, 0.1)
+            sharpen = st.checkbox("Sharpen", True)
+            binarize = st.checkbox("Binarize", False)
+
+        retry_json = st.checkbox("Auto-retry if JSON parse fails (1 retry)", True)
+        show_raw = st.checkbox("Debug: show raw model response", False)
+
+        # ---- model select (Gemini 2) ----
+        model_label = st.selectbox(
+            "AI Model",
+            ["Gemini 2 Flash", "Gemini 2 Flash Lite"],
+            index=0
+        )
+        model_name = "gemini-2.0-flash" if model_label == "Gemini 2 Flash" else "gemini-2.0-flash-lite"
+
+    model = get_model(api_key, model_name, temperature, max_output_tokens)
     prompt = build_prompt()
 
-    # ---------------- Upload ----------------
+    st.divider()
+
     uploaded_files = st.file_uploader(
         "Upload FAX files (JPG/PNG/JPEG/PDF)",
         type=["jpg", "png", "jpeg", "pdf"],
@@ -257,9 +272,9 @@ def run():
             st.warning("ファイルをアップロードしてください。")
             st.stop()
 
-        # Pre-count tasks for progress
+        # ---- plan tasks for progress ----
         total_tasks = 0
-        file_plan = []  # list of dict describing each unit
+        plan = []
 
         for uf in uploaded_files:
             if uf.type == "application/pdf":
@@ -269,7 +284,7 @@ def run():
                     total_pages = len(doc)
                     use_pages = min(total_pages, max_pages)
                     total_tasks += use_pages
-                    file_plan.append({"name": uf.name, "type": "pdf", "bytes": b, "total_pages": total_pages, "use_pages": use_pages})
+                    plan.append({"type": "pdf", "name": uf.name, "bytes": b, "total_pages": total_pages, "use_pages": use_pages})
                 except Exception as e:
                     st.session_state.logs.append({
                         "timestamp": datetime.now().isoformat(),
@@ -279,7 +294,7 @@ def run():
                     })
             else:
                 total_tasks += 1
-                file_plan.append({"name": uf.name, "type": "img", "file": uf})
+                plan.append({"type": "img", "name": uf.name, "file": uf})
 
         if total_tasks == 0:
             st.error("解析対象がありません（PDFが壊れている/ページ制限/ファイル形式の問題の可能性）。")
@@ -291,47 +306,51 @@ def run():
         results_all = []
         completed = 0
 
-        for fp in file_plan:
-            if fp["type"] == "pdf":
-                images, total_pages, use_pages = pdf_to_images(fp["bytes"], max_pages=use_pages, dpi=dpi)
+        def call_model(image_for_model: Image.Image, reprompt: bool = False) -> str:
+            p = prompt
+            if reprompt:
+                p = p + "\n\n【再出力指示】必ずJSON配列のみを返す。文章・コードブロックは禁止。"
+            resp = model.generate_content([p, image_for_model])
+            return getattr(resp, "text", "") or ""
+
+        for item in plan:
+            if item["type"] == "pdf":
+                images, total_pages, use_pages = pdf_to_images(item["bytes"], max_pages=item["use_pages"], dpi=dpi)
+                if total_pages > max_pages:
+                    st.info(f"ℹ {item['name']}: {total_pages} pages detected → analyzing first {use_pages} pages.")
+
                 for page_idx, img in enumerate(images, start=1):
-                    status.text(f"Processing: {fp['name']} (page {page_idx}/{use_pages})  |  {completed+1}/{total_tasks}")
+                    status.text(f"Processing: {item['name']} (page {page_idx}/{use_pages})  |  {completed+1}/{total_tasks}")
 
                     t0 = time.time()
                     try:
                         pre = preprocess_image(img, contrast=contrast, sharpen=sharpen, binarize=binarize)
 
-                        resp = model.generate_content([prompt, pre])
-                        raw = getattr(resp, "text", "") or ""
-
+                        raw = call_model(pre, reprompt=False)
                         rows = safe_json_extract(raw)
 
-                        # retry once with stricter instruction
                         if rows is None and retry_json:
-                            reprompt = prompt + "\n\n【再出力指示】必ずJSON配列のみを返す。文字列説明は禁止。"
-                            resp2 = model.generate_content([reprompt, pre])
-                            raw2 = getattr(resp2, "text", "") or ""
+                            raw2 = call_model(pre, reprompt=True)
                             rows = safe_json_extract(raw2)
                             if show_raw:
-                                st.write(f"RAW (retry) {fp['name']} p{page_idx}:")
+                                st.write(f"RAW (retry) {item['name']} p{page_idx}:")
                                 st.code(raw2)
 
                         if show_raw:
-                            st.write(f"RAW {fp['name']} p{page_idx}:")
+                            st.write(f"RAW {item['name']} p{page_idx}:")
                             st.code(raw)
 
-                        meta = {
-                            "元ファイル": fp["name"],
-                            "ページ": str(page_idx),
-                        }
+                        meta = {"元ファイル": item["name"], "ページ": str(page_idx)}
                         norm = normalize_rows(rows, meta=meta)
+
                         if norm:
                             results_all.extend(norm)
                             st.session_state.logs.append({
                                 "timestamp": datetime.now().isoformat(),
                                 "status": "success",
-                                "file": fp["name"],
+                                "file": item["name"],
                                 "page": page_idx,
+                                "model": model_name,
                                 "elapsed_sec": round(time.time() - t0, 3),
                                 "rows": len(norm),
                             })
@@ -339,8 +358,9 @@ def run():
                             st.session_state.logs.append({
                                 "timestamp": datetime.now().isoformat(),
                                 "status": "no_rows_or_parse_failed",
-                                "file": fp["name"],
+                                "file": item["name"],
                                 "page": page_idx,
+                                "model": model_name,
                                 "elapsed_sec": round(time.time() - t0, 3),
                             })
 
@@ -348,47 +368,48 @@ def run():
                         st.session_state.logs.append({
                             "timestamp": datetime.now().isoformat(),
                             "status": "error",
-                            "file": fp["name"],
+                            "file": item["name"],
                             "page": page_idx,
+                            "model": model_name,
                             "detail": str(e),
                         })
 
                     completed += 1
                     prog.progress(min(1.0, completed / total_tasks))
+                    time.sleep(0.05)
 
             else:
-                status.text(f"Processing: {fp['name']}  |  {completed+1}/{total_tasks}")
+                status.text(f"Processing: {item['name']}  |  {completed+1}/{total_tasks}")
 
                 t0 = time.time()
                 try:
-                    img = Image.open(fp["file"])
+                    img = Image.open(item["file"])
                     pre = preprocess_image(img, contrast=contrast, sharpen=sharpen, binarize=binarize)
 
-                    resp = model.generate_content([prompt, pre])
-                    raw = getattr(resp, "text", "") or ""
+                    raw = call_model(pre, reprompt=False)
                     rows = safe_json_extract(raw)
 
                     if rows is None and retry_json:
-                        reprompt = prompt + "\n\n【再出力指示】必ずJSON配列のみを返す。文字列説明は禁止。"
-                        resp2 = model.generate_content([reprompt, pre])
-                        raw2 = getattr(resp2, "text", "") or ""
+                        raw2 = call_model(pre, reprompt=True)
                         rows = safe_json_extract(raw2)
                         if show_raw:
-                            st.write(f"RAW (retry) {fp['name']}:")
+                            st.write(f"RAW (retry) {item['name']}:")
                             st.code(raw2)
 
                     if show_raw:
-                        st.write(f"RAW {fp['name']}:")
+                        st.write(f"RAW {item['name']}:")
                         st.code(raw)
 
-                    meta = {"元ファイル": fp["name"], "ページ": ""}
+                    meta = {"元ファイル": item["name"], "ページ": ""}
                     norm = normalize_rows(rows, meta=meta)
+
                     if norm:
                         results_all.extend(norm)
                         st.session_state.logs.append({
                             "timestamp": datetime.now().isoformat(),
                             "status": "success",
-                            "file": fp["name"],
+                            "file": item["name"],
+                            "model": model_name,
                             "elapsed_sec": round(time.time() - t0, 3),
                             "rows": len(norm),
                         })
@@ -396,7 +417,8 @@ def run():
                         st.session_state.logs.append({
                             "timestamp": datetime.now().isoformat(),
                             "status": "no_rows_or_parse_failed",
-                            "file": fp["name"],
+                            "file": item["name"],
+                            "model": model_name,
                             "elapsed_sec": round(time.time() - t0, 3),
                         })
 
@@ -404,12 +426,14 @@ def run():
                     st.session_state.logs.append({
                         "timestamp": datetime.now().isoformat(),
                         "status": "error",
-                        "file": fp["name"],
+                        "file": item["name"],
+                        "model": model_name,
                         "detail": str(e),
                     })
 
                 completed += 1
                 prog.progress(min(1.0, completed / total_tasks))
+                time.sleep(0.05)
 
         status.empty()
         prog.empty()
@@ -418,9 +442,9 @@ def run():
             st.session_state.orders = pd.DataFrame(results_all)
             st.success(f"Done. Extracted {len(st.session_state.orders)} rows.")
         else:
-            st.warning("解析結果が0件でした。FAX画像の解像度・コントラスト・傾き、またはプロンプト条件を見直してください。")
+            st.warning("解析結果が0件でした。Logsを確認してください（no_rows_or_parse_failed が多い場合、画像品質/前処理/プロンプト調整が必要です）。")
 
-    # ---------------- Results / Exports ----------------
+    # ---- Results ----
     if not st.session_state.orders.empty:
         st.divider()
         st.subheader("🧾 Extracted Orders")
@@ -459,7 +483,7 @@ def run():
                 st.session_state.orders = pd.DataFrame()
                 st.rerun()
 
-    # ---------------- Logs ----------------
+    # ---- Logs ----
     with st.expander("📜 Logs / Diagnostics", expanded=False):
         log_df = pd.DataFrame(st.session_state.logs)
         if log_df.empty:
