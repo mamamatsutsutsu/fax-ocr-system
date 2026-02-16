@@ -1,6 +1,6 @@
 streamlit
 google-generativeai
-pandas
 Pillow
-gspread
+pandas
 reportlab
+PyMuPDF
