@@ -1,5 +1,5 @@
 streamlit
-google-generative-ai
+google-generativeai
 pandas
 Pillow
 gspread
