@@ -3,5 +3,4 @@ google-generative-ai
 pandas
 Pillow
 gspread
-oauth2client
 reportlab
